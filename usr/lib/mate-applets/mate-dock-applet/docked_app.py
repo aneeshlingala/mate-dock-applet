@@ -1,0 +1,1800 @@
+#!/usr/bin/env python3
+"""Provide functionality relating to an app in a dock.
+
+    Allow info relating to a running app (e.g. icon, command line,
+    .desktop file location, running processes, open windows etc) to be
+    obtained from the information that libWnck provides
+
+    Provide a surface on which the application's icon and the running indicator
+    can be drawn
+
+    Ensure that the app's icon and indicator are always drawn correctly
+    according to the size and orientation of the panel
+
+    Provide visual feedback to the user when an app is launched by pulsating
+    the app's icon
+
+    Draw a highlight around the app's icon if it is the foreground app
+
+    Maintain a list of all of the app's running processes and their windows
+
+    Ensure that the application's windows visually minimise to the
+    application's icon on the dock
+"""
+
+#
+# Copyright (C) 1997-2003 Free Software Foundation, Inc.
+#
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License as
+# published by the Free Software Foundation; either version 2 of the
+# License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+# General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA
+# 02110-1301, USA.
+#
+# Author:
+#     Robin Thompson
+
+# do not change the value of this variable - it will be set during build
+# according to the value of the --with-gtk3 option used with .configure
+build_gtk2 = False
+
+import gi
+
+if build_gtk2:
+    gi.require_version("Gtk", "2.0")
+    gi.require_version("Wnck", "1.0")
+else:
+    gi.require_version("Gtk", "3.0")
+    gi.require_version("Wnck", "3.0")
+
+gi.require_version("MatePanelApplet", "4.0")
+gi.require_version("Bamf", "3")
+
+from gi.repository import Gtk
+from gi.repository import MatePanelApplet
+from gi.repository import Gdk
+from gi.repository import GdkPixbuf
+from gi.repository import Wnck
+from gi.repository import Gio
+from gi.repository import GObject
+from gi.repository import GLib
+from gi.repository import Bamf
+
+import cairo
+import math
+import xdg.DesktopEntry as DesktopEntry
+import xdg.BaseDirectory as BaseDirectory
+import os
+import os.path
+import subprocess
+import re
+import colorsys
+
+from collections import namedtuple
+
+import dock_prefs
+from docked_app_helpers import *
+import window_control
+
+from log_it import log_it as log_it
+
+ColorTup = namedtuple('ColorTup', ['r', 'g', 'b'])
+
+
+def get_backlight_color(pixbuf):
+    """
+
+    Read all of the pixel values in a pixbuf and calculate an appropriate
+    colour to use as an icon backlight
+
+    Code adapated from Unity desktop (https://code.launchpad.net/~unity-team/unity/trunk)
+    specifically from LauncherIcon::ColorForIcon in LauncherIcon.cpp
+
+    Args:
+        pixbuf  : a pixbuf object containing the image
+
+    Returns:
+        a tuple of r,g,b value (0-255)
+    """
+
+    width = pixbuf.props.width
+    rowstride = pixbuf.props.rowstride
+    height = pixbuf.props.height
+
+    num_channels = pixbuf.get_n_channels()
+    has_alpha = pixbuf.get_has_alpha()
+
+    img = pixbuf.get_pixels()
+    r_total = g_total = b_total = 0
+    total = 0.0
+
+    for w_count in range(width):
+        for h_count in range(height):
+            pix_index = (h_count * rowstride + w_count * num_channels)
+            pix_r = img[pix_index]
+            pix_g = img[pix_index + 1]
+            pix_b = img[pix_index + 2]
+            if has_alpha:
+                pix_a = img[pix_index + 3]
+            else:
+                pix_a = 255
+
+            saturation = float(max(pix_r, max(pix_g, pix_b)) - min(pix_r, min(pix_g, pix_b))) / 255.0
+            relevance = .1 + .9 * (float(pix_a) / 255) * saturation
+
+            r_total += (pix_r * relevance) % 256
+            g_total += (pix_g * relevance) % 256
+            b_total += (pix_b * relevance) % 256
+            total += relevance * 255.0
+
+    r = r_total / total
+    g = g_total / total
+    b = b_total / total
+
+    h, s, v = colorsys.rgb_to_hsv(r, g, b)
+    if s > 0.15:
+        s = 0.65
+
+    v = 0.6666
+    # Note: Unty uses v = 0.9, but this produces a very bright value which
+    # is reduced elsewhere. We use 0.6666 to reduce it here
+    br, bg, bb = colorsys.hsv_to_rgb(h, s, v)
+
+    v = 1.0
+    gr, gg, gb = colorsys.hsv_to_rgb(h, s, v)
+
+    return int(br * 255), int(bg * 255), int(bb * 255)
+
+
+def get_avg_color(pixbuf):
+    """calculate the average colour of a pixbuf.
+
+    Read all of the pixel values in a pixbuf (excluding those which are below a
+    certain alpha value) and calculate the average colour of all the contained
+    colours
+
+    Args:
+        pixbuf  : a pixbuf object containing the image
+
+    Returns:
+        a tuple of r,g,b values (0-255)
+    """
+
+    width = pixbuf.props.width
+    rowstride = pixbuf.props.rowstride
+    height = pixbuf.props.height
+    has_alpha = pixbuf.get_has_alpha()
+    pixels = pixbuf.get_pixels()
+    nchannels = pixbuf.get_n_channels()
+    # convert the pixels into an rgb array with alpha channel
+    data = []
+    for y_count in range(height - 1):
+        x_count = 0
+        while x_count < (width * nchannels):
+            pix_red = pixels[x_count + (rowstride * y_count)]
+            pix_green = pixels[x_count + 1 + (rowstride * y_count)]
+            pix_blue = pixels[x_count + 2 + (rowstride * y_count)]
+            if has_alpha:
+                pix_alpha = pixels[x_count + 3 + (rowstride * y_count)]
+            else:
+                pix_alpha = 255
+
+            data.append([pix_red, pix_green, pix_blue, pix_alpha])
+
+            x_count += nchannels
+
+    red = 0
+    green = 0
+    blue = 0
+    num_counted = 0
+
+    for pixels in range(len(data)):
+        if data[pixels][3] > 200:       # only count pixel if alpha above this
+                                        # level
+            red += data[pixels][0]
+            green += data[pixels][1]
+            blue += data[pixels][2]
+            num_counted += 1
+
+    if num_counted > 0:
+        ravg = int(red / num_counted)
+        gavg = int(green / num_counted)
+        bavg = int(blue / num_counted)
+    else:
+        # in case of a bad icon assume a grey average colour
+        # this should fix a division by zero error that occurred at this point
+        # in the code, but which I've only seen once and never been able to
+        # duplicate
+        ravg = gavg = bavg = 128
+
+    return ravg, gavg, bavg
+
+
+CONST_PULSE_STEPS = 20
+CONST_PULSE_DELAY = 40
+
+
+class ScrollType:
+    """ Class to define the ways in which the docked apps may scroll in the dock"""
+    SCROLL_NONE = 0
+    SCROLL_UP = 1    # for horizontal applets 'up' equates to 'left'
+    SCROLL_DOWN = 2  # or, for horizontal applets, right...
+
+
+class PulseTimer(object):
+    """Class to help provide feedback when a user launches an app from the dock.
+
+    Instantiates a timer which periodically redraws an application in the dock
+    at various transparency levels until the timer has been run a certain
+    number of times
+
+    Attributes:
+        app = the DockedApp object which we want to pulsate
+        timer_id = the id of the timer that is instantiated
+
+    """
+
+    def __init__(self, app, once_only=False):
+        """Init for the PulseTimer class.
+
+        Sets everything up by creating the timer, setting a reference to the
+        DockedApp and telling the app that it is pulsing
+
+        Arguments:
+            app : the DockedApp object
+            once_only : do only one iteration of pulsing, then stop
+        """
+
+        self.timer_count = 0
+        self.app = app
+        self.app.pulse_step = 0
+        self.app.is_pulsing = True
+        self.once_only = once_only
+        self.timer_id = GObject.timeout_add(CONST_PULSE_DELAY, self.do_timer)
+
+    def do_timer(self):
+        """The timer function.
+
+        Increments the number of times the time function has been called. If it
+        hasn't reached the maximum number, increment the app's pulse counter.
+        If the maximum number has been reached, stop the app pulsing and
+        delete the timer.
+
+        Redraw the app's icon
+        """
+
+        # the docked app may indicate it no longer wants to pulse...
+        if not self.app.is_pulsing:
+            self.remove_timer()
+            self.app.queue_draw()
+            return False
+
+        self.timer_count += 1
+        if self.timer_count / int(1000 / CONST_PULSE_DELAY) == 45:
+            # we've been pulsing for long enough, the user will be getting a headache
+            self.remove_timer()
+            self.app.queue_draw()
+            return False
+
+        if self.app.pulse_step != CONST_PULSE_STEPS:
+            self.app.pulse_step += 1
+        else:
+            # if we're starting the app for the first time (with startup notification)
+            # and it still hasn't finished loading, carry on pulsing
+            if (self.app.startup_id is not None) and not self.once_only:
+                self.app.pulse_step = 0
+            else:
+                # we only want the icon to pulse once
+                # if we have a startup_id the notification needs to be cancelled
+                if self.app.startup_id is not None:
+                    self.app.cancel_startup_notification()
+
+                self.remove_timer()
+
+        self.app.queue_draw()
+        return True
+
+    def remove_timer(self):
+        """
+            Cancel the timer and stop the app icon pulsing...
+
+        """
+
+        self.app.is_pulsing = False
+        GObject.source_remove(self.timer_id)
+
+
+CONST_BLINK_DELAY = 330
+
+
+class AttentionTimer(object):
+    """Class to help provide visual feedback when an app requries user attention.
+
+    Instantiates a timer which periodically checks whether or not the app
+    still needs attention. If the app is blinking, it toggles the
+    blink state
+    on and off until the app no longer needs attention
+
+    Attributes:
+        app = the DockedApp object that needs attentions
+        timer_id = the id of the timer that is instantiated
+
+    """
+
+    def __init__(self, app):
+        """Init for the AttentionTimer class.
+
+        Sets everything up by creating the timer, setting a reference to the
+        DockedApp and setting the inital flash state to off
+
+        Arguments:
+            app : the DockedApp object
+        """
+
+        self.app = app
+        self.app.needs_attention = True
+        self.app.attention_blink_on = False
+        self.timer_id = GObject.timeout_add(CONST_BLINK_DELAY, self.do_timer)
+
+        # make the app redraw itself
+        app.queue_draw()
+
+    def do_timer(self):
+        """The timer function.
+
+        If the app no longer needs attention, stop it flashing and delete
+        the timer. Otherwise, invert the flash.
+
+        Finally,Redraw the app's icon
+        """
+
+        if self.app.needs_attention:
+            self.app.attention_blink_on = not self.app.attention_blink_on
+        else:
+            GObject.source_remove(self.timer_id)
+
+        self.app.queue_draw()
+
+        return True
+
+
+class DockedApp(object):
+    """Provide a docked app class
+
+    Attributes:
+
+        bamf_app    : the Bamf.Applications related to the running app
+        app_name    : e.g. Google Chrome, used for tooltips and the applet
+                      right click menu etc
+        rc_actions  : A list of strings containing the names of the additional application
+                      actions suppported by the app
+        cmd_line    : the command line and arguments used to start the app
+        icon_name   : name of the app icon
+        icon_filename : the filename of the app icon
+        desktop_file : the filename of the app's .desktop file
+        desktop_ai   : a Gio.GDesktopAppInfo read from the .desktop file
+        startup_id   : id used for startup notifications
+        applet_win  : the Gdk.Window of the panel applet
+        applet      : the panel applet
+        applet_orient : the applet orientation
+
+        drawing_area: Gtk.Label- provides a surface on which the app icon can
+                              be drawn
+        drawing_area_size : the base size in pixels (height AND width) that we have
+                            to draw in - note that some indicators require more
+                            and must specify this...
+        is_pulsing  : boolean - True if the app is pulsing
+        pulse_step  : a count of how far we are through the pulse animation
+        app_pb      : a pixbuf of the app's icon
+        app_surface : a surface of the app's icon
+        highlight_colour : ColorTup of the colours used to highlight the app
+                           when it is foreground
+        is_active   : boolean - True = the app is the foreground app
+        has_mouse   : boolean - True = the mouse is over the app's icon
+        is_pinned   : boolean - Whether or not the app is pinned to the dock
+        indicator   : the type of indictor (e.g. light or dark) to draw under
+                      running apps
+        active_bg   : the type of background (e.g. gradient or solid fill) to
+                      be drawn when the app is the active app
+        ind_ws      : wnck_workspace or None - if set, indicators are to be
+                      drawn for windows on the specified workspace
+        last_active_win : the Bamf.Window of the app's last active window
+
+        is_dragee  : boolean - indicates whether or not the app's icon is
+                     being dragged to a new position on the dock
+
+        show_progress : boolean - indicates whether or not to display a
+                        progress indicator on the app's icon
+        progress_val  : the progress value( 0 to 1.0)
+        show_count   : boolean - indicates whether or not to display a
+                        count value on the app's icon
+        count_val   : the value of the count
+        needs_attention: whether or not the app needs the user's attention
+        attention_type : how the docked app indicates to the user that the app
+                         needs attention
+        attention_blink_on : when an app blinks when it needs attention, this specfies
+                             the state
+        scroll_dir : indicates the way that the dock may be scrolled (if any)
+                     if the mouse hovers over this app. Also used to draw the
+                     app icon in such a way as to indicate that scrolling is available
+    """
+
+    def __init__(self):
+        """ Init for the DockApplet class.
+
+            Create a surface to draw the app icon on
+            Set detault values
+        """
+
+        super().__init__()
+
+        self.bamf_app = None
+        self.app_info = []
+        self.app_name = ""
+        self.rc_actions = []
+        self.cmd_line = ""
+        self.icon_name = ""
+        self.icon_filename = ""
+        self.desktop_file = ""
+        self.desktop_ai = None
+        self.icon_geometry_set = False
+        self.applet_win = None
+        self.applet_orient = None
+        self.ind_ws = None
+        self.startup_id = None
+        self.applet = None
+
+        # all drawing is done to a Gtk.Label rather than e.g. a drawing area
+        # or event box this allows panel transparency/custom backgrounds to be
+        # honoured
+        # However, the downside of this is that mouse events cannot be handled
+        # by this class and instead have to be done by the applet itself
+
+        self.drawing_area = Gtk.Label()
+        self.drawing_area.set_app_paintable(True)
+        self.drawing_area_size = 0
+
+        self.is_pulsing = False
+        self.pulse_step = 0
+
+        self.needs_attention = False
+        self.attention_blink_on = False
+
+        self.app_pb = None
+        self.app_surface = None
+        self.highlight_color = ColorTup(r=0.0, g=0.0, b=0.0)
+
+        self.is_active = False
+        self.has_mouse = False
+
+        self.is_pinned = False
+
+        # set defaults
+        self.indicator = IndicatorType.LIGHT     # light indicator
+        self.multi_ind = False                   # single indicator
+        self.active_bg = IconBgType.GRADIENT
+
+        self.attention_type = dock_prefs.AttentionType.BLINK
+
+        self.last_active_win = None
+
+        # set up event handler for the draw/expose event
+        if build_gtk2:
+            self.drawing_area.connect("expose-event", self.do_expose_event)
+        else:
+            self.drawing_area.connect("draw", self.do_expose_event)
+
+        self.is_dragee = False
+
+        self.show_progress = False
+        self.progress_val = 0.0
+        self.show_count = False
+        self.count_val = 0
+
+        self.scroll_dir = ScrollType.SCROLL_NONE
+
+    def set_bamf_app(self, b_app):
+        """ Sets the Bamf.Application related to this docked app
+
+        Params: b_app : the Bamf.Application to be added
+        """
+
+        self.bamf_app = b_app
+
+    def clear_bamf_app(self):
+        """ Unsets the Bamf.Application related to this docked app
+
+        Params: b_app : the Bamf.Application to removed """
+
+        self.bamf_app = None
+
+    def has_bamf_app(self, b_app):
+        """ Returns True if b_app is associated with this docked_app, False otherwise
+
+            Params: b_app - a Bamf.Application
+        """
+
+        return b_app == self.bamf_app
+
+    def get_windows(self):
+        """ Convenience function to return a list of the app's Bamf.Windows
+
+        Returns : an empty list if the app is not running or if self.bamf_app is None,
+                  otherwise the window list
+
+        """
+
+        ret_val = []
+        if (self.bamf_app is not None) and (self.bamf_app.is_running() or self.bamf_app.is_starting()):
+            ret_val = self.bamf_app.get_windows()
+
+        return ret_val
+
+    def get_first_normal_win(self):
+        """ Returns the app's first 'normal' window i.e. a window or dialog
+
+            Returns:
+                a Bamf.Window, or None
+        """
+
+        if (self.bamf_app is not None) and (self.bamf_app.is_running()):
+            for win in self.get_windows():
+                win_type = win.get_window_type()
+                if win_type in [Bamf.WindowType.NORMAL, Bamf.WindowType.DIALOG] or win.is_user_visible():
+                    return win
+
+        return None
+
+    def has_wnck_app(self, wnck_app):
+        """ see if this app has a process with the specified wnck_app
+
+        Returns True if the wnck_app is found, False otherwise
+        """
+
+        ret_val = False
+        for aai in self.app_info:
+            if aai.app == wnck_app:
+                ret_val = True
+                break
+
+        return ret_val
+
+    def has_bamf_window(self, win):
+        """
+            Checks to see if a window belongs to the app
+
+        Params:
+            win : the Bamf.Window we're interested in
+
+        Returns:
+            True if the window belongs to the app, False otherwise
+
+        """
+
+        windows = self.get_windows()
+        return win in windows
+
+    def setup_from_bamf(self, app_match_list):
+        """ Setup an already running app using info from self.bamf_app
+
+        This is only called when bamf cannot match an app with it's .desktop file,
+        so we can also do some extra checking from the list of hard to match
+        .desktop files
+
+        """
+
+        # get a list of all the possible locations of .desktop files
+        data_dirs = BaseDirectory.xdg_data_dirs
+        app_dirs = []
+        for dir in data_dirs:
+            app_dirs.append(os.path.join(dir, "applications/"))
+
+        # search for a match in
+        for app in app_match_list:
+            if self.bamf_app.get_name() == app[0]:
+
+                for dir in app_dirs:
+                    desktop_file = os.path.join(dir, app[2])
+                    if os.path.exists(desktop_file):
+                        self.desktop_file = desktop_file
+                        if self.read_info_from_desktop_file():
+                            return
+
+        # no match, so just get basic info
+        self.app_name = self.bamf_app.get_name()
+        self.icon_name = "wnck"  # indicate we want to get the app icon from wnck
+
+    def set_app_name(self, app_name):
+        """sets the app name.
+
+        Stores the entire name, which may or may not also contain a
+        document title or other app specific info. This will need to
+        be parsed when necessary to obtain the actual app name
+
+        Args: The app name
+
+        """
+
+        self.app_name = app_name
+
+    def set_urgency(self, urgent):
+        """ Sets the app's urgency state
+
+        Params : urgent - bool, whether or not the app is signalling urgency
+        """
+
+        if urgent:
+            if not self.needs_attention:
+                self.needs_attention = True
+                self.attention_blink_on = False  # initial blink state = off
+                timer = AttentionTimer(self)
+
+                if not self.is_visible():
+                    self.show_icon()
+        else:
+            if self.needs_attention:
+                # we need to turn flashing off
+                self.needs_attention = False
+                self.queue_draw()
+
+                # the timer will handle the rest ....
+                # hiding the icon (if necessary) will be taken care of next
+                # time the user changes workspace
+
+    def get_cmdline_from_pid(self, pid):
+        """ Find the command line and arguments used to launch the app
+
+        Use the ps command to return the command line and arguments
+        for the specified pid
+
+        Set self.path to the full command line
+
+        Args:
+            pid - a process id
+
+        """
+
+        cmdstr = "xargs -0 < /proc/%d/cmdline" % pid
+
+        cmd = subprocess.Popen(cmdstr, shell=True, stdout=subprocess.PIPE)
+
+        for line in cmd.stdout:
+            pass
+
+        if line is not None:
+            self.cmd_line = line.decode("utf-8")
+
+    def has_windows_on_workspace(self, wnck_workspace):
+        """ test whether the app has at least one window open on a specified
+            workspace
+
+        Args:
+            wnck_workspace - the workspace to check for
+
+        Returns:
+            boolean
+        """
+
+        for win in self.get_windows():
+            wnck_win = Wnck.Window.get(win.get_xid())
+            if wnck_win is not None:
+                win_ws = wnck_win.get_workspace()
+                if win_ws == wnck_workspace:
+                    return True
+
+        return False
+
+    def has_unminimized_windows(self):
+        """ test whether the app has at least one unminimized window
+
+        Returns:
+            boolean
+        """
+
+        win_list = self.get_windows()
+        for win in win_list:
+            wnck_win = Wnck.Window.get(win.get_xid())
+            if (wnck_win is not None) and (not wnck_win.is_minimized()):
+                return True
+
+        return False
+
+    def hide_icon(self):
+        """ Hides the app's icon"""
+
+        self.drawing_area.set_visible(False)
+
+    def show_icon(self):
+        """ Shows the app's icon"""
+
+        self.drawing_area.set_visible(True)
+
+    def is_visible(self):
+        """ Method which returns whether or not the app's icon is visible
+
+        Returns:
+            boolean
+        """
+        return self.drawing_area.get_visible()
+
+    def get_desktop_from_custom_launcher(self, srch_dir):
+        """ Search the custom launchers in a specified directory for
+            one where the Exec field is found within self.cmd_line
+
+        If a match is found found, self.desktop_file is set accordingly
+
+        Note: All custom launchers  .desktop filenames start
+              with "mda_"
+
+        Args:
+            srch_dir : the directory to search
+
+        Returns:
+            True if a match was found, False otherwise
+        """
+
+        # TODO: replace DesktopEntry with Gio.DesktopAppInfo... and then
+
+        # if the search dir doesn't exist, don't do anything
+        if os.path.isdir(srch_dir) is False:
+            return False
+
+        for the_file in os.listdir(srch_dir):
+            if (the_file.startswith("mda_")) and \
+               (the_file.endswith(".desktop")):
+                the_de = DesktopEntry.DesktopEntry(srch_dir + the_file)
+
+                # remove command line args from the Exec field of the .desktop
+                de_exec = the_de.getExec().split(None, 1)[0]
+
+                if self.cmd_line.find(de_exec) != -1:
+                    self.desktop_file = srch_dir + the_file
+                    return True
+
+    def set_all_windows_icon_geometry(self, x, y, width, height):
+        """Set the location on screen where all of the app's windows will be
+           minimised to.
+
+        Args:
+            x : The X position in root window coordinates
+            y : The Y position in root window coordinates
+            width: the width of the minimise location
+            height:  the height of the minimise location
+
+        """
+
+        for win in self.get_windows():
+            window_control.set_minimise_target(win, x, y, width, height)
+
+        return True
+
+    def get_allocation(self):
+        """ Returns the allocated position and size of the app's icon within the applet
+        """
+
+        alloc = self.drawing_area.get_allocation()
+        return alloc.x, alloc.y, alloc.width, alloc.height
+
+    def set_drawing_area_size(self, size):
+        """Set the size request of the app's drawing area.
+
+        Args :
+            size : the size in pixels we need, although extra can be applied if required by indicators
+
+        """
+        self.drawing_area_size = size
+
+        extra_s = ind_extra_s(self.indicator)
+        if extra_s == 0:
+            self.drawing_area.set_size_request(size, size)
+        else:
+            # we need to allocate extra space in the x or y dimension depending on applet orientation
+            if (self.applet_orient == MatePanelApplet.AppletOrient.DOWN) or \
+               (self.applet_orient == MatePanelApplet.AppletOrient.UP):
+                self.drawing_area.set_size_request(size + extra_s, size)
+            else:
+                self.drawing_area.set_size_request(size, size + extra_s)
+
+    def queue_draw(self):
+        """Queue the app's icon to be redrawn.
+        """
+        self.drawing_area.queue_draw()
+
+    def set_indicator(self, indicator):
+        """Set the running indicator type to the value specified
+
+        Args:
+            indicator - the indicator type
+        """
+        self.indicator = indicator
+
+    def set_active_bg(self, active_bg):
+        """Set the active background type to the value specified
+
+        Args:
+            active_bg - the background type
+
+        """
+
+        self.active_bg = active_bg
+
+    def set_multi_ind(self, multi_ind):
+        """ Set whether to use an indicator for each open window
+
+        Args:
+            multi_ind - boolean
+        """
+        self.multi_ind = multi_ind
+
+    def set_attention_type(self, attention_type):
+        """Set the attention type to the value specified
+
+        Args:
+            indicator - the indicator type
+        """
+        self.attention_type = attention_type
+
+    def is_running(self):
+        """
+            Is the app running ?
+
+        Returns: True if the app is running, False if not
+
+        """
+
+        if self.bamf_app is None:
+            return False
+
+        return self.bamf_app.is_running()
+
+    def has_desktop_file(self):
+        """ Does the app have a .desktop file?
+
+        Returns: True if there is a desktop file, False otherwise
+        """
+
+        return self.desktop_file is not None
+
+    def read_info_from_desktop_file(self):
+        """Attempt to read from read the app's desktop file.
+
+        Will try to read the icon name and app name from the desktop file
+        Will also get the executeable path if we don't already have this
+        Will read the details of any right click menu options the .desktop
+        file defines
+
+        Returns:
+            True if successful, False otherwise
+        """
+
+        if self.desktop_file:
+            if os.path.isabs(self.desktop_file):
+                self.desktop_ai = Gio.DesktopAppInfo.new_from_filename(self.desktop_file)
+            else:
+                self.desktop_ai = Gio.DesktopAppInfo.new(self.desktop_file)
+
+            self.app_name = self.desktop_ai.get_string("Name")
+            self.icon_name = self.desktop_ai.get_string("Icon")
+
+            # if the desktop file does not specify an icon name, use the app
+            # name instead
+            if (self.icon_name is None) or (self.icon_name == ""):
+                self.icon_name = self.app_name.lower()
+
+                # hack for the MATE application browser app, where the
+                # .desktop file on Ubuntu does not specify an icon
+                if self.icon_name == "application browser":
+                    self.icon_name = "computer"
+
+            # get the command specified in the .desktop file used to launch the app
+            self.cmd_line = self.desktop_ai.get_string("Exec")
+
+            # get the list of addtional application actions (to be activated by right
+            # clicking the app's dock icon)
+            self.rc_actions = self.desktop_ai.list_actions()
+
+            return True
+
+        return False
+
+    def app_has_custom_launcher(self):
+        """ Determines whether the docked app has a custom launcher
+
+        Examine the .desktop filename. If it starts with
+        "~/.local/share/applications/mda_" the app has a custom launcher
+
+        Returns : True if the app has a custom launcher, False otherwise
+        """
+
+        cl_start = os.path.expanduser("~/.local/share/applications/mda_")
+        return os.path.expanduser(self.desktop_file).beginswith(cl_start)
+
+    def win_state_changed(self, wnck_win, changed_mask, new_state):
+        """Handler for the wnck_window state-changed event
+
+        If the app needs attention and we're not already flashing the icon
+        start it flashing. If the app icon is not visible, make it visible
+
+        If the app doesn't need attention and its icon is flashing, stop
+        it flashing
+
+        """
+
+        if ((new_state & Wnck.WindowState.DEMANDS_ATTENTION) != 0) or\
+           ((new_state & Wnck.WindowState.URGENT) != 0):
+
+            if not self.needs_attention:
+                self.needs_attention = True
+                self.attention_blink_on = False  # initial blink state = off
+                timer = AttentionTimer(self)
+
+                if not self.is_visible():
+                    self.show_icon()
+
+        else:
+            if self.needs_attention:
+                # we need to turn flashing off
+                self.needs_attention = False
+                self.queue_draw()
+
+                # the timer will handle the rest ....
+                # hiding the icon (if necessary) will be taken care of next
+                # time the user changes workspace
+
+    def get_num_windows(self, cur_ws=None):
+        """
+            Get the number of normal and dialog windows the app has open.
+            If cur_ws is specfied, then only windows on the specified workspace are counted
+
+            Params: cur_ws - an int representing the workspace number:
+
+            Returns: an int
+
+        """
+
+        num_win = 0
+
+        if self.bamf_app is not None:
+            for win in self.get_windows():
+                win_type = win.get_window_type()
+                if win_type in [Bamf.WindowType.NORMAL, Bamf.WindowType.DIALOG] and win.is_user_visible():
+                    if cur_ws is None:
+                        num_win += 1
+                    else:
+                        xid = win.get_xid()
+                        wnck_win = Wnck.Window.get(xid)
+                        if (wnck_win is not None) and wnck_win.is_on_workspace(cur_ws):
+                            num_win += 1
+        return num_win
+
+    def do_expose_event(self, drawing_area, event):
+        """The main drawing event for the docked app.
+
+        Does the following:
+            draw the app icon
+            if the mouse is over the app icon, highlight the icon
+            if the is running draw the app running indicators(according to the
+            applet orientation)
+            if the app is the foreground app, highlight the background with a
+            gradient fill
+            if the app is pulsing, draw the icon with a variable level of
+            transparency according to the pulse count
+            if the app is flashing, draw the icon either fully opaque or
+            completely transparent according to its flash state
+            if the app is being dragged to a new position on the dock, draw
+            a completely transparent background
+        Args:
+            drawing_area : the drawing area that related to the event. Will
+                           always be the same as self.drawing area
+            event        : in Gtk2 the event arguments, in Gtk3 a cairo context
+                           to draw on
+
+        """
+
+        # there are lots of drawing operations to be done, so do them to an
+        # offscreen surface and when all is finished copy this to the docked
+        # app
+
+        if self.applet_orient == MatePanelApplet.AppletOrient.DOWN or \
+           self.applet_orient == MatePanelApplet.AppletOrient.UP:
+            oss_w = self.drawing_area_size + ind_extra_s(self.indicator)
+            oss_h = self.drawing_area_size
+        else:
+            oss_w = self.drawing_area_size
+            oss_h = self.drawing_area_size + ind_extra_s(self.indicator)
+
+        offscreen_surface = cairo.Surface.create_similar(self.app_surface,
+                                                         cairo.CONTENT_COLOR_ALPHA,
+                                                         oss_w, oss_h)
+
+        ctx = cairo.Context(offscreen_surface)
+
+        if self.is_dragee is False:
+            # convert the highlight values to their cairo equivalents
+            red = self.highlight_color.r / 255
+            green = self.highlight_color.g / 255
+            blue = self.highlight_color.b / 255
+
+            dbgd = None
+
+            if self.applet_win is not None:
+                scale_factor = self.applet_win.get_scale_factor()
+            else:
+                scale_factor = 1
+
+            if self.active_bg == IconBgType.UNITY_FLAT:
+                dbgd = UnityFlatBackgroundDrawer(ctx, self.drawing_area_size,
+                                                 self.applet_orient, red, green, blue,
+                                                 self.is_running(), scale_factor)
+            elif self.active_bg == IconBgType.UNITY:
+                dbgd = UnityBackgroundDrawer(ctx, self.drawing_area_size,
+                                             self.applet_orient, red, green, blue,
+                                             self.is_running(), scale_factor)
+            elif self.is_active:
+                if self.active_bg == IconBgType.GRADIENT:
+                    dbgd = DefaultBackgroundDrawer(ctx, self.drawing_area_size,
+                                                   self.applet_orient, red, green, blue)
+                else:
+                    dbgd = AlphaFillBackgroundDrawer(ctx, self.drawing_area_size,
+                                                     self.applet_orient, red, green, blue, 0.5)
+
+            if dbgd is not None:
+                dbgd.draw()
+
+        # draw the app icon
+        if self.active_bg in [IconBgType.UNITY_FLAT, IconBgType.UNITY]:
+            pb_size = (self.drawing_area_size) * 0.75
+            offset = self.drawing_area_size / 2 - pb_size / 2
+            ctx.set_source_surface(self.app_surface, offset, offset)
+        else:
+            ctx.set_source_surface(self.app_surface, 3, 3)
+
+        if self.is_pulsing:
+            # draw the icon semi-transparently according to how far through the
+            # animation we are
+
+            half_way = int(CONST_PULSE_STEPS / 2)
+            if self.pulse_step <= half_way:
+                alpha = 1.0 - (self.pulse_step / half_way)
+            else:
+                alpha = 0.0 + (self.pulse_step - half_way) / half_way
+
+            ctx.paint_with_alpha(alpha)
+
+        elif self.needs_attention and self.attention_type == dock_prefs.AttentionType.BLINK:
+            if self.attention_blink_on:
+                ctx.paint()  # draw normally if in the flash on state
+        elif self.is_dragee:
+            ctx.paint_with_alpha(0.0)
+        else:
+            ctx.paint()
+            ctx.save()
+            if self.active_bg == IconBgType.UNITY_FLAT:
+                if self.is_running():
+                    dbgd.draw_shine()
+            elif self.active_bg == IconBgType.UNITY:
+                dbgd.draw_shine()
+            ctx.restore()
+
+        if (self.has_mouse is True) and ((self.is_dragee is False) and (self.scroll_dir == ScrollType.SCROLL_NONE)):
+            # lighten the icon
+            ctx.set_operator(cairo.OPERATOR_ADD)
+            ctx.paint_with_alpha(0.2)
+            ctx.set_operator(cairo.OPERATOR_OVER)
+        elif (self.has_mouse is True) and (self.scroll_dir != ScrollType.SCROLL_NONE):
+            # this app indicates the dock can scroll, so we darken it
+            ctx.set_operator(cairo.OPERATOR_DEST_OUT)
+            ctx.paint_with_alpha(0.5)
+            ctx.set_operator(cairo.OPERATOR_OVER)
+
+        # draw the app running indicators
+        if (self.is_running()) and \
+           (self.indicator != IndicatorType.NONE) and \
+           (self.is_dragee is False):
+
+            # work out how many indicators to draw - either a single one or
+            # one for each open window up to a maximum of 4, and take into
+            # account the fact that we might only be showing indicators from
+            # the current workspace
+
+            # get the number of indicators to show...
+            if self.multi_ind is False and self.indicator != IndicatorType.SUBWAY:
+                num_ind = 1
+            else:
+                num_ind = self.get_num_windows(self.ind_ws)
+                if num_ind > 4:
+                    num_ind = 4
+
+            ind = None
+            if self.indicator == IndicatorType.LIGHT:
+                ind = DefaultLightInd(ctx, self.drawing_area_size,
+                                      self.applet_orient, num_ind)
+            elif self.indicator == IndicatorType.DARK:
+                ind = DefaultDarkInd(ctx, self.drawing_area_size,
+                                     self.applet_orient, num_ind)
+            elif self.indicator == IndicatorType.TBAR:
+                ind = ThemeBarInd(ctx, self.drawing_area_size, self.applet_orient, self.applet)
+            elif self.indicator == IndicatorType.TCIRC:
+                ind = ThemeCircleInd(ctx, self.drawing_area_size, self.applet_orient, self.applet, num_ind)
+            elif self.indicator == IndicatorType.TSQUARE:
+                ind = ThemeSquareInd(ctx, self.drawing_area_size, self.applet_orient, self.applet, num_ind)
+            elif self.indicator == IndicatorType.TTRI:
+                ind = ThemeTriInd(ctx, self.drawing_area_size, self.applet_orient, self.applet, num_ind)
+            elif self.indicator == IndicatorType.TDIA:
+                ind = ThemeDiaInd(ctx, self.drawing_area_size, self.applet_orient, self.applet, num_ind)
+            elif self.indicator == IndicatorType.SUBWAY:
+                ind = SubwayInd(ctx, self.drawing_area_size, self.applet_orient,
+                                self.applet, num_ind, offscreen_surface, self.is_active)
+
+            if ind is not None:
+                ind.draw()
+
+        # do we need a count?
+        if self.show_count:
+            self.draw_count(ctx)
+
+        if self.show_progress:
+            self.draw_progress(ctx)
+
+        if self.needs_attention and self.attention_type == dock_prefs.AttentionType.SHOW_BADGE:
+            self.draw_attention_badge(ctx)
+
+        if not build_gtk2:
+            # scrolling only available in GTK3
+            if self.has_mouse and (self.scroll_dir != ScrollType.SCROLL_NONE):
+                if self.scroll_dir == ScrollType.SCROLL_UP:
+                    self.draw_scroll_up(ctx)
+                elif self.scroll_dir == ScrollType.SCROLL_DOWN:
+                    self.draw_scroll_down(ctx)
+
+        # now draw to the screen
+        if build_gtk2:
+            screen_ctx = self.drawing_area.window.cairo_create()
+            screen_ctx.rectangle(event.area.x, event.area.y,
+                                 event.area.width, event.area.height)
+            screen_ctx.clip()
+
+            alloc = self.drawing_area.get_allocation()
+            if (self.applet_orient == MatePanelApplet.AppletOrient.UP) or \
+               (self.applet_orient == MatePanelApplet.AppletOrient.DOWN):
+                screen_ctx.set_source_surface(offscreen_surface, alloc.x, 0)
+            else:
+                screen_ctx.set_source_surface(offscreen_surface, 0, alloc.y)
+
+            screen_ctx.paint()
+            screen_ctx = None
+        else:
+            event.set_source_surface(offscreen_surface, 0, 0)
+            event.paint()
+            alloc = self.drawing_area.get_allocation()
+
+        ctx = None
+
+    def draw_count(self, ctx):
+        """ Draw the app's counter value
+
+        Args: ctx - the cairo context where the counter is to be drawn
+        """
+
+        # drawing is done at a notional size  64x64 px, and then scaled
+        # appropriately according to self.drawing_area_size
+
+        draw_size = 64.0
+
+        # height of the counter = 2 pix border top and bottom + 16 pix
+        # internal height
+        height = 20
+
+        # work out the appropriate font size to use - has to fit within the
+        # borders and provide some space above and below the count_val
+        reqd_font_height = height - 8
+
+        # find a font size where the count can be shown with the required height
+        ctx.select_font_face("", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        ctext = "%d" % self.count_val
+        for fsize in range(24, 2, -1):
+            ctx.set_font_size(fsize)
+            extents = ctx.text_extents(ctext)
+
+            if extents[3] < reqd_font_height:
+                font_size = fsize
+                break
+
+        # work out an appropriate width for the counter
+        inset = height / 2
+        radius = inset - 1
+        if int(extents[2] + extents[0]) > int(radius):
+            width = extents[2] + extents[0] + radius
+        else:
+            width = height + inset
+
+        ctx.save()
+
+        # the background color of the count is the app's highlight colour
+        # convert the highlight values to their cairo equivalents
+        bred = self.highlight_color.r / 255
+        bgreen = self.highlight_color.g / 255
+        bblue = self.highlight_color.b / 255
+
+        # set an appropriate text and border color
+        if bred + bgreen + bblue > 1.5:  # mid-level grey
+            tred = tgreen = tblue = 0.0
+        else:
+            tred = tgreen = tblue = 1.0
+
+        # the count is placed in the upper right of the drawing area, and we need
+        # to calculate it's position based on the notional DA_SIZE
+        #
+
+        adj = 2
+        left = draw_size - width + inset - adj
+
+        # do the drawing - attribution for the drawing code:
+        # https://bazaar.launchpad.net/~unity-team/unity/trunk/view/head:/launcher/LauncherIcon.cpp
+        ctx.scale(self.drawing_area_size / draw_size,
+                  self.drawing_area_size / draw_size)
+
+        ctx.move_to(left, height - 1 + adj)
+        ctx.arc(left, inset + adj, radius, 0.5 * math.pi, 1.5 * math.pi)
+        ctx.arc(draw_size - inset - adj, inset + adj, radius, 1.5 * math.pi, 0.5 * math.pi)
+        ctx.line_to(left, height - 1 + adj)
+        ctx.set_source_rgb(bred, bgreen, bblue)
+        ctx.fill_preserve()
+        ctx.set_source_rgb(tred, tgreen, tblue)
+        ctx.set_line_width(2)
+        ctx.stroke()
+
+        # draw the text
+        ctx.move_to(left - inset + width / 2 - (extents[0] + extents[2] / 2),
+                    (height / 2) + adj + extents[3] / 2)
+        ctx.set_source_rgb(tred, tgreen, tblue)
+        ctx.show_text(ctext)
+
+        ctx.restore()
+
+    def draw_progress(self, ctx):
+        """ Draw a progress bar to show the app's progress value
+
+        Args: ctx - the cairo context where the counter is to be drawn
+        """
+
+        def rounded_rectangle(cr, x, y, w, h, r=20):
+            """ Convenience function to draw a rounded rectangle
+                # Attribution:
+                # https://stackoverflow.com/questions/2384374/rounded-rectangle-in-pygtk
+                # This is just one of the samples from
+                # http://www.cairographics.org/cookbook/roundedrectangles/
+                #   A****BQ
+                #  H      C
+                #  *      *
+                #  G      D
+                #   F****E
+            """
+
+            cr.move_to(x + r, y)                      # Move to A
+            cr.line_to(x + w - r, y)                    # Straight line to B
+            cr.curve_to(x + w, y, x + w, y, x + w, y + r)
+            # Curve to C, Control points are both at Q
+            cr.line_to(x + w, y + h - r)                  # Move to D
+            cr.curve_to(x + w, y + h, x + w, y + h, x + w - r, y + h)  # Curve to E
+            cr.line_to(x + r, y + h)                    # Line to F
+            cr.curve_to(x, y + h, x, y + h, x, y + h - r)  # Curve to G
+            cr.line_to(x, y + r)                      # Line to H
+            cr.curve_to(x, y, x, y, x + r, y)             # Curve to A
+
+        # drawing is done on a to scale of 64x64 pixels and then scaled
+        # down to the fit the app's drawing area
+        draw_size = 64.0
+
+        # the foreground colour of the progress is the app's highlight colour
+        # convert the highlight values to their cairo equivalents
+        fred = self.highlight_color.r / 255
+        fgreen = self.highlight_color.g / 255
+        fblue = self.highlight_color.b / 255
+
+        # set an appropriate border color and also a background colour for
+        # the progress bar, based on the highlight colour
+        if fred + fgreen + fblue > 1.5:  # mid-level grey
+            brd_red = brd_green = brd_blue = 0.0
+            bk_red = bk_green = bk_blue = 1.0
+        else:
+            brd_red = brd_green = brd_blue = 1.0
+            bk_red = bk_green = bk_blue = 0.0
+
+        height = 8              # total height of the progress bar
+        line_width = 2          # border line width
+        int_height = height - line_width * 2  # interior height
+        left = 8.5
+        width = draw_size - left * 2   # width of the progress bar
+
+        top = (draw_size / 8) * 5 + 0.5
+
+        ctx.save()
+        ctx.scale(self.drawing_area_size / draw_size, self.drawing_area_size / draw_size)
+
+        # fill the interior with the background colour
+        ctx.set_line_width(1)
+        ctx.set_source_rgb(bk_red, bk_green, bk_blue)
+        rounded_rectangle(ctx, left, top, width, height, 7)
+        ctx.stroke_preserve()
+        ctx.fill()
+
+        # fill part of the interior with a different colour, depending on
+        # the progress value
+        ctx.set_source_rgb(fred, fgreen, fblue)
+        rounded_rectangle(ctx, left + line_width - 1, top,
+                          (width - (line_width - 1) * 2) * self.progress_val,
+                          height, 7)
+        ctx.fill()
+
+        # draw exterior of the progress bar
+        ctx.set_source_rgb(brd_red, brd_green, brd_blue)
+        ctx.set_line_width(2)
+        rounded_rectangle(ctx, left, top, width, height, 7)
+        ctx.stroke()
+
+        ctx.restore()
+
+    def draw_attention_badge(self, ctx):
+        """ Draw a badge on the app icon to indicate the app requires
+            attention
+
+        Basically a copy and paste of draw_count...
+
+        Args: ctx - the cairo context where the counter is to be drawn
+        """
+
+        # drawing is done at a notional size  64x64 px, and then scaled
+        # appropriately according to self.drawing_area_size
+
+        draw_size = 64.0
+
+        # height of the exaclamation mark = 2 pix border top and bottom + 16 pix
+        # internal height
+        height = 20
+
+        # work out the appropriate font size to use - has to fit within the
+        # borders and provide some space above and below the exclamation mark
+        reqd_font_height = height - 8
+
+        # find a font size where the count can be shown with the required height
+        ctx.select_font_face("", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        ctext = "!"
+        for fsize in range(24, 2, -1):
+            ctx.set_font_size(fsize)
+            extents = ctx.text_extents(ctext)
+
+            if extents[3] < reqd_font_height:
+                font_size = fsize
+                break
+
+        # work out an appropriate width for the badge
+        inset = height / 2
+        radius = inset - 1
+        if int(extents[2] + extents[0]) > int(radius):
+            width = extents[2] + extents[0] + radius
+        else:
+            width = height
+            # width = height + inset
+
+        width = extents[2] + extents[0] + radius
+        ctx.save()
+
+        # the background color of the badge is the app's highlight colour
+        # convert the highlight values to their cairo equivalents
+        bred = self.highlight_color.r / 255
+        bgreen = self.highlight_color.g / 255
+        bblue = self.highlight_color.b / 255
+
+        # set an appropriate text and border color
+        if bred + bgreen + bblue > 1.5:  # mid-level grey
+            tred = tgreen = tblue = 0.0
+        else:
+            tred = tgreen = tblue = 1.0
+
+        # the badge is placed in the upper left of the drawing area
+        adj = 2
+        left = inset
+
+        # do the drawing - attribution for the drawing code:
+        # https://bazaar.launchpad.net/~unity-team/unity/trunk/view/head:/launcher/LauncherIcon.cpp
+        ctx.scale(self.drawing_area_size / draw_size,
+                  self.drawing_area_size / draw_size)
+
+        ctx.move_to(left, height - 1 + adj)
+        ctx.arc(left, inset + adj, radius, 0.5 * math.pi, 1.5 * math.pi)
+        ctx.arc(left + width - inset - adj, inset + adj, radius, 1.5 * math.pi, 0.5 * math.pi)
+        ctx.line_to(left, height - 1 + adj)
+        ctx.set_source_rgb(bred, bgreen, bblue)
+        ctx.fill_preserve()
+        ctx.set_source_rgb(tred, tgreen, tblue)
+        ctx.set_line_width(2)
+        ctx.stroke()
+
+        # draw the text
+        ctx.move_to(left + inset - (extents[0] + extents[2] / 2) - radius,
+                    (height / 2) + adj + extents[3] / 2)
+        ctx.set_source_rgb(tred, tgreen, tblue)
+        ctx.show_text(ctext)
+
+        ctx.restore()
+
+    def draw_scroll_up(self, ctx):
+        """ To indicate that the docked app can scroll up (or left on horizontal panels)
+            draw an up (or left) arrow on the icon
+
+        Params :
+            context : the docked app's cairo context for us to draw on
+            size : the size of the context, in pixels
+            orient : the orientation of the dock applet
+        """
+
+        if self.drawing_area_size > 48:
+            icon_size = Gtk.IconSize.DND
+            icon_pix = 24
+        else:
+            icon_size = Gtk.IconSize.LARGE_TOOLBAR
+            icon_pix = 16
+
+        if self.applet_orient in [MatePanelApplet.AppletOrient.UP,
+                                  MatePanelApplet.AppletOrient.DOWN]:
+
+            arrow_pb = self.drawing_area.render_icon(Gtk.STOCK_GO_BACK, icon_size, None)
+            arrow_pb = arrow_pb.scale_simple(self.drawing_area_size / 2, self.drawing_area_size / 2,
+                                             GdkPixbuf.InterpType.BILINEAR)
+
+            Gdk.cairo_set_source_pixbuf(ctx, arrow_pb, 0, self.drawing_area_size / 4)
+
+        else:
+            arrow_pb = self.drawing_area.render_icon(Gtk.STOCK_GO_UP, icon_size, None)
+            arrow_pb = arrow_pb.scale_simple(self.drawing_area_size / 2, self.drawing_area_size / 2,
+                                             GdkPixbuf.InterpType.BILINEAR)
+
+            Gdk.cairo_set_source_pixbuf(ctx, arrow_pb, self.drawing_area_size / 4, 0)
+
+        ctx.paint()
+
+    def draw_scroll_down(self, ctx):
+        """ To indicate that the docked app can scroll up (or left on horizontal panels)
+            draw an up (or left) arrow on the icon
+
+        Params :
+            context : the docked app's cairo context for us to draw on
+            size : the size of the context, in pixels
+            orient : the orientation of the dock applet
+        """
+
+        if self.drawing_area_size > 48:
+            icon_size = Gtk.IconSize.DND
+            icon_pix = 24
+        else:
+            icon_size = Gtk.IconSize.LARGE_TOOLBAR
+            icon_pix = 16
+
+        if self.applet_orient in [MatePanelApplet.AppletOrient.UP,
+                                  MatePanelApplet.AppletOrient.DOWN]:
+
+            arrow_pb = self.drawing_area.render_icon(Gtk.STOCK_GO_FORWARD, icon_size, None)
+            arrow_pb = arrow_pb.scale_simple(self.drawing_area_size / 2, self.drawing_area_size / 2,
+                                             GdkPixbuf.InterpType.BILINEAR)
+
+            Gdk.cairo_set_source_pixbuf(ctx, arrow_pb, self.drawing_area_size / 2,
+                                        self.drawing_area_size / 4)
+
+        else:
+            arrow_pb = self.drawing_area.render_icon(Gtk.STOCK_GO_DOWN, icon_size, None)
+            arrow_pb = arrow_pb.scale_simple(self.drawing_area_size / 2, self.drawing_area_size / 2,
+                                             GdkPixbuf.InterpType.BILINEAR)
+
+            Gdk.cairo_set_source_pixbuf(ctx, arrow_pb, self.drawing_area_size / 4, self.drawing_area_size / 2)
+
+        ctx.paint()
+
+    def set_pixbuf(self, pixbuf):
+        """Set the app pixbuf and calculate its average colour.
+        """
+
+        self.app_pb = pixbuf
+
+        rht, ght, bht = self.highlight_color = get_backlight_color(pixbuf)
+        self.highlight_color = ColorTup(r=rht, g=ght, b=bht)
+
+    def set_surface(self, surface):
+        """Set the app surface
+        """
+
+        self.app_surface = surface
+
+    def start_app(self):
+        """Start the app or open a new window if it's already running
+
+            Use Gio.DesktopAppinfo as it supports startup notfication
+        """
+        # start the app
+        run_it = self.desktop_ai.get_string("Exec")
+
+        if run_it is not None:
+
+            # hack for Linux Mint:
+            # Mint has several shortcuts for starting caja so that it can
+            # be started in a specific directory e.g. home, /, etc
+            # However, the main caja.desktop is responsible for starting the
+            # user's desktop and this is the .desktop file the applet finds
+            # first.
+            # When the caja icon on the applet is clicked, caja is run as a
+            # desktop window and no new file browser appears.
+            # To get around this, we can simply check the command that is going
+            # to be run and change it so that a caja window opens in the user's
+            # home directory, which is the behaviour they'll probably be
+            # expecting....
+            if run_it == "/usr/bin/startcaja":
+                run_it = "caja"
+                self.run_cmd_line(run_it)
+                return
+
+        gdai = Gio.DesktopAppInfo.new_from_filename(self.desktop_file)
+        disp = Gdk.Display.get_default()
+        if build_gtk2:
+            alc = Gdk.AppLaunchContext()
+        else:
+            alc = disp.get_app_launch_context()
+
+        alc.set_desktop(-1)  # use default screen & desktop
+        alc.set_timestamp(Gtk.get_current_event_time())
+        alc.connect("launch-failed", self.launch_failed)
+
+        # indicate we want startup notification
+        self.startup_id = alc.get_startup_notify_id(gdai, [])
+
+        gdai.launch_uris_as_manager([], alc, GLib.SpawnFlags.SEARCH_PATH,
+                                    None, None, None, None)
+
+        # make the app's icon pulse
+        if not self.is_running():
+            throbber = PulseTimer(self)
+        else:
+            # if the app is already running, we want the icon to pulse at most once only
+            # For apps which don't open a new window, the pulse timer will end up cancelling
+            # the unneeded startup notification
+            throbber = PulseTimer(self, True)
+
+    def cancel_startup_notification(self):
+        """
+            Cancel any startup notification
+        """
+
+        if build_gtk2:
+            Gdk.notify_startup_complete_with_id(self.startup_id)
+        else:
+            display = Gdk.Display.get_default()
+            display.notify_startup_complete(self.startup_id)
+
+        self.startup_id = None
+
+    def launch_failed(self, app_launch_context, startup_id):
+        """Handler for app launch failure events
+
+        Cancel the startup notification
+
+            Args:
+                app_launch_context : the Gdk.AppLaunchContext that failed
+                startup_id : the startup notification id
+        """
+
+        self.cancel_startup_notification()
+
+        display = Gdk.Display.get_default()
+        display.notify_startup_complete(startup_id)
+
+    def run_cmd_line(self, cmd_line):
+        """Run a command line.
+
+            Args:
+                cmd_line - the command to run
+        """
+
+        # TODO: this is old code and needs to be removed
+
+        # the command line may contain escape sequences, so unescape them....
+        cmd_line = bytearray(cmd_line, "UTF-8")
+        cmd_line = cmd_line.decode("unicode-escape")
+
+        # if an environment variable is specified, extract its name an value
+        # Note: the .desktop file specification at
+        # https://specifications.freedesktop.org/desktop-entry-spec/latest/ar01s06.html
+        # does not mention this. Both Ubuntu
+        # https://help.ubuntu.com/community/EnvironmentVariables#Launching_desktop_application_with_an_environment_variable
+        # and Arch linux
+        # https://wiki.archlinux.org/index.php/Desktop_entries#Modify_environment_variables
+        # seem to indicate that only a single variable can be set and that
+        # there are no spaces between the variable name, the '=' character and
+        # variable's value .....
+
+        # so, if cmd_line begins with "env" it specifies an environment variable
+        # to set, follwed by the app e.g. env LANG=he_IL.UTF-8 /usr/bin/pluma
+        #
+        if cmd_line.startswith("env"):
+            cmd_parts = cmd_line.split(" ", 2)
+            var_parts = cmd_parts[1].split("=")
+            var_name = var_parts[0]
+            var_value = var_parts[1]
+
+            # now we need to get the app path and args and carry on...
+            cmd_line = cmd_parts[2]
+        else:
+            var_name = None
+            var_value = None
+
+        # if any of the directories in cmd_line contain a " ", they need to be
+        # escaped
+        head, tail = os.path.split(cmd_line)
+        if " " in head:
+            head = head.replace(" ", "\\ ")
+            cmd_line = head + "/" + tail
+        app_info = Gio.AppInfo.create_from_commandline(cmd_line,
+                                                       None,
+                                                       Gio.AppInfoCreateFlags.SUPPORTS_STARTUP_NOTIFICATION)
+        alc = Gdk.AppLaunchContext()
+        alc.set_desktop(-1)                   # use default screen & desktop
+        alc.set_timestamp(Gtk.get_current_event_time())
+
+        # if the .desktop specfied an environment variable, set it
+        if (var_name is not None) and (var_value is not None):
+            alc.setenv(var_name, var_value)
+
+        file_list = GLib.List()
+
+        # app_info.launch(None, alc)
+        self.startup_id = alc.get_startup_notify_id(app_info, [])
+
+        throbber = PulseTimer(self)
+
+    def run_rc_action(self, act_no):
+        """ run the right click action specified by act_no
+
+        Args:
+           act_no - integer, the action number to run
+        """
+
+        if len(self.rc_actions) >= act_no:
+            if build_gtk2:
+                alc = Gdk.AppLaunchContext()
+            else:
+                disp = Gdk.Display.get_default()
+                alc = disp.get_app_launch_context()
+
+            alc.set_desktop(-1)  # use default screen & desktop
+            alc.set_timestamp(Gtk.get_current_event_time())
+            alc.connect("launch-failed", self.launch_failed)
+
+            # indicate we want startup notification
+            self.startup_id = alc.get_startup_notify_id(self.desktop_ai, [])
+
+            self.desktop_ai.launch_action(self.rc_actions[act_no - 1], alc)
+            self.start_pulsing()
+
+    def get_rc_action(self, act_no):
+        """ return a specified right click action's details
+
+        Args:
+            act_no - integer, the specified action number
+
+        Returns:
+                bool - True if the action exists, False otherwise
+                string - the name of the action (i.e. the text to appear in the
+                right click menu)
+        """
+
+        if len(self.rc_actions) >= act_no:
+            return True, self.desktop_ai.get_action_name(self.rc_actions[act_no - 1])
+        else:
+            return False, ""
+
+    def start_pulsing(self):
+        """ start the dock icon pulsing
+        """
+
+        throbber = PulseTimer(self)
+
+    def pulse_once(self):
+        """ Make the dock icon pulse once"""
+
+        throbber = PulseTimer(self, True)
+
+    def set_dragee(self, is_dragee):
+        """ Set the flag which indicates whether or not this app is being
+            dragged to a new position on the dock
+
+        Set the value of the self.is_dragee flag and redraw the app icon
+        """
+
+        self.is_dragee = is_dragee
+        self.queue_draw()
+
+    def set_progress_visible(self, is_visible):
+        """
+            Update the progress visibility and cause the app's icon to be
+            redrawn
+
+        Args:
+            is_visible : whether the progress is to be displayed
+        """
+
+        if is_visible != self.show_progress:
+            self.show_progress = bool(is_visible)
+            self.queue_draw()
+
+    def set_progress_value(self, val):
+        """
+            Update the progress value and cause the app's icon to be
+            redrawn
+
+        Args:
+            val        : the counter value
+        """
+
+        # if the new progressvalue is the same as the old, then there's no need
+        # to do anything...
+        if val != self.progress_val:
+            self.progress_val = val
+            self.queue_draw()
+
+    def set_counter_visible(self, is_visible):
+        """
+            Update the counter visibility and cause the app's icon to be
+            redrawn
+
+        Args:
+            is_visible : whether the counter is to be displayed
+        """
+
+        # if the new value is the same as the old, then there's no need
+        # to do anything...
+        if is_visible != self.show_count:
+            self.show_count = bool(is_visible)
+            self.queue_draw()
+
+    def set_counter_value(self, val):
+        """
+            Update the counter value and cause the app's icon to be
+            redrawn
+
+        Args:
+            val        : the counter value
+        """
+
+        # if the new counter value is the same as the old, then there's no need
+        # to do anything...
+        if val != self.count_val:
+            self.count_val = val
+            self.queue_draw()
+
+    def set_scroll_dir(self, scroll_dir):
+        """
+            Sets the app's scroll direction
+
+        Param: scroll_dir - a docked_app_helpers.ScrollType
+        """
+
+        self.scroll_dir = scroll_dir
+
+
+def main():
+    """Main function.
+
+    Debugging code can go here
+    """
+    pass
+
+
+if __name__ == "__main__":
+    main()

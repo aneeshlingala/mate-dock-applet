@@ -1,0 +1,73 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: MATE Dock Applet
+Upstream-Contact: Robin Thompson
+Source: https://github.com/robint99/dock-applet
+
+Files: src/log_it.in
+ src/dock_xml.in
+ src/docked_app.in
+ src/dock_prefs.in
+ src/dom_color.in
+ src/dock_action_list.in
+ src/dock_color_changer.in
+ src/dock_applet.in
+ src/dock_custom_launcher.in
+ src/dock_info.in
+ src/dock_popup.in
+ src/dock.in
+ src/dock_win_list.in
+ src/dock_about.in
+ src/app_match.xml
+ src/window_control.in
+Copyright: 2015, Robin Thompson (https://github.com/robint99)
+License: GPL-3+
+
+Files: AUTHORS
+ ChangeLog
+ configure.ac
+ .gitignore
+ .github/FUNDING.yml
+ INSTALL
+ Makefile.am
+ NEWS
+ README
+ README.md
+ src/assets/unity_dock_edge_168.svg
+ src/assets/unity_dock_shine_56.svg
+ src/assets/unity_dock_bg_56.svg
+ src/assets/unity_dock_shine_168.svg
+ src/assets/unity_dock_edge_56.svg
+ src/assets/unity_dock_bg_168.svg
+ src/docked_app_helpers.in
+ src/org.mate.panel.DockApplet.mate-panel-applet.in
+ src/Makefile.am
+ src/org.mate.panel.applet.DockAppletFactory.service.in
+ src/org.mate.panel.applet.dock.gschema.xml
+Copyright: 2015, Robin Thompson (https://github.com/robint99)
+License: GPL-3+
+Comment:
+ Neither license nor copyright information specified in the above
+ files. Assuming copyright holder as found in the other Python
+ files, assuming license as found in COPYING file.
+
+Files: debian/*
+Copyright: 2015, Alin Andrei <webupd8@gmil.com>
+           2015, Martin Wimpress <code@flexion.org>
+           2016, Mike Gabriel <sunweaver@debian.org>
+License: GPL-3+
+
+License: GPL-3+
+ This program is free software; you can redistribute it and/or modify it under
+ the terms of the GNU General Public License as published by the Free Software
+ Foundation, either version 3 of the License, or (at your option) any later
+ version.
+ .
+ This program is distributed in the hope that it will be useful, but WITHOUT ANY
+ WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+ PARTICULAR PURPOSE.  See the GNU General Public License for more details.
+ .
+ You should have received a copy of the GNU General Public License along with
+ this program.  If not, see .
+ .
+ On Debian systems, the complete text of the GNU General
+ Public License can be found in `/usr/share/common-licenses/GPL-3'.
